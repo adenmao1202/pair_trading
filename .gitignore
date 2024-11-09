@@ -1,1 +1,5 @@
 .DS_Store
+op_file/all_stocks.parquet
+op_file/all_stocks_daily.parquet
+output/all_stocks.parquet
+output/all_stocks_daily.parquet

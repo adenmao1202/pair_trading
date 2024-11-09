@@ -17,20 +17,21 @@ class PairTradingResult:
     positions: pd.DataFrame
     returns: pd.Series
     metrics: Dict
+    exposures: pd.DataFrame  # Added to track position exposures
 
-class PairsDataProcessor:
+
+#################################################################################################
+class PairsDataProcessor:  # checked  
     def __init__(self, data_folder: Path):
         self.data_folder = data_folder
         
     def load_stock_data(self, stock_code: str, file_path: Path) -> Optional[pd.DataFrame]:
-        """Read and process individual stock data with error handling."""
         try:
-            # 只讀取必要的欄位來減少記憶體使用
             stock_df = pd.read_csv(
                 file_path,
                 parse_dates=['ts'],
-                usecols=['ts', 'Close'],  # 只讀取需要的欄位
-                dtype={'Close': 'float32'}  # 使用較小的數據類型
+                usecols=['ts', 'Close'],
+                dtype={'Close': 'float32'}
             )
             
             if stock_df.empty:
@@ -46,12 +47,10 @@ class PairsDataProcessor:
     def resample_to_daily(self, 
                          stock_df: pd.DataFrame,
                          trading_days: pd.DatetimeIndex) -> Optional[pd.DataFrame]:
-        """Optimized daily resampling."""
         try:
             if stock_df is None or stock_df.empty:
                 return None
             
-            # 直接使用last而不是複雜的聚合
             daily_df = stock_df.resample('D').last()
             daily_df = daily_df.reindex(trading_days)
             return daily_df
@@ -60,21 +59,17 @@ class PairsDataProcessor:
             return None
     
     def combine_stock_data(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """優化的股票數據處理"""
         all_stocks_daily = {}
         
-        # 預先獲取交易日曆
         trading_days = mcal.get_calendar('XTAI').schedule(
             start_date=start_date, 
             end_date=end_date
         ).index
         
-        # 獲取所有CSV文件
         csv_files = list(self.data_folder.glob('*.csv'))
         total_files = len(csv_files)
         print(f"Found {total_files} CSV files")
         
-        # 使用較少的線程數進行並行處理
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             future_to_stock = {
                 executor.submit(self.load_and_process_stock, csv_file, trading_days): csv_file.stem
@@ -91,7 +86,6 @@ class PairsDataProcessor:
                     if result is not None:
                         all_stocks_daily[stock_code] = result
                         
-                    # 顯示進度
                     if completed % 10 == 0:
                         progress = (completed / total_files) * 100
                         print(f"Loading progress: {progress:.1f}% ({completed}/{total_files} files)")
@@ -102,20 +96,14 @@ class PairsDataProcessor:
         
         print(f"\nSuccessfully loaded {len(all_stocks_daily)} stocks")
         
-        # 轉換為DataFrame並確保數據完整性
         df = pd.DataFrame(all_stocks_daily)
-        
-        # 移除過多缺失值的列
-        threshold = len(df.columns) * 0.5  # 如果超過50%的數據缺失，則移除該行
+        threshold = len(df.columns) * 0.5
         df = df.dropna(thresh=threshold)
-        
-        # 用前向填充方法處理剩餘的缺失值
         df = df.fillna(method='ffill').fillna(method='bfill')
         
         return df
     
     def load_and_process_stock(self, csv_file: Path, trading_days: pd.DatetimeIndex) -> Optional[pd.Series]:
-        """Helper function for parallel processing."""
         stock_df = self.load_stock_data(csv_file.stem, csv_file)
         if stock_df is None:
             return None
@@ -126,32 +114,35 @@ class PairsDataProcessor:
             
         return daily_df['Close']
 
+
+
+#########################################################################
+
 class PairsTradingStrategy:
     def __init__(self, 
                  lookback_period: int = 60,
-                 zscore_threshold: float = 2.0,
+                 enter_long_zscore_threshold: float = 1.0,
+                 enter_short_zscore_threshold: float = 1.0,
+                 exit_zscore_threshold: float = 0.0,  # Added exit threshold
                  min_samples: int = 252,
                  coint_pvalue: float = 0.10,
                  min_correlation: float = 0.7):
         self.lookback_period = lookback_period
-        self.zscore_threshold = zscore_threshold
+        self.enter_long_zscore_threshold = enter_long_zscore_threshold
+        self.enter_short_zscore_threshold = enter_short_zscore_threshold
+        self.exit_zscore_threshold = exit_zscore_threshold
         self.min_samples = min_samples
         self.coint_pvalue = coint_pvalue
         self.min_correlation = min_correlation
     
     def prepare_pair_data(self, y: pd.Series, x: pd.Series) -> Tuple[pd.Series, pd.Series]:
-        """準備並清理配對數據"""
-        # 使用向量化操作而不是循環
         mask = ~np.isnan(y) & ~np.isnan(x)
         return y[mask], x[mask]
     
     def calculate_hedge_ratio(self, y: pd.Series, x: pd.Series) -> float:
-        """使用NumPy進行快速線性回歸"""
         return np.cov(y, x)[0, 1] / np.var(x)
     
     def calculate_zscore(self, spread: pd.Series) -> pd.Series:
-        """優化的z分數計算"""
-        # 使用向量化操作
         mean = pd.Series(index=spread.index, dtype='float32')
         std = pd.Series(index=spread.index, dtype='float32')
         
@@ -163,20 +154,27 @@ class PairsTradingStrategy:
         return (spread - mean) / std
     
     def generate_signals(self, zscore: pd.Series) -> pd.Series:
-        """優化的信號生成"""
+        """Enhanced signal generation with position tracking"""
         signals = pd.Series(0, index=zscore.index)
         position = 0
         
-        # 使用NumPy的向量化操作
-        long_entries = (zscore < -self.zscore_threshold) & (position == 0)
-        short_entries = (zscore > self.zscore_threshold) & (position == 0)
-        long_exits = (zscore >= 0) & (position == 1)
-        short_exits = (zscore <= 0) & (position == -1)
-        
-        signals[long_entries] = 1
-        signals[short_entries] = -1
-        signals[long_exits | short_exits] = 0
-        
+        for i in range(len(zscore)):
+            if position == 0:  # No position
+                if zscore.iloc[i] < -self.enter_long_zscore_threshold:
+                    position = 1
+                    signals.iloc[i] = 1
+                elif zscore.iloc[i] > self.enter_short_zscore_threshold:
+                    position = -1
+                    signals.iloc[i] = -1
+            elif position == 1:  # Long position
+                if zscore.iloc[i] >= self.exit_zscore_threshold:
+                    position = 0
+                    signals.iloc[i] = 0
+            elif position == -1:  # Short position
+                if zscore.iloc[i] <= self.exit_zscore_threshold:
+                    position = 0
+                    signals.iloc[i] = 0
+                    
         return signals
     
     def calculate_returns(self, 
@@ -184,180 +182,273 @@ class PairsTradingStrategy:
                          signals: pd.Series, 
                          hedge_ratio: float,
                          transaction_cost: float = 0.001) -> pd.Series:
-        """優化的收益計算"""
-        # 使用向量化操作
+        """Enhanced returns calculation with proper position sizing"""
+        # Calculate returns for both stocks
         stock1_rets = pair_data.iloc[:, 0].pct_change()
         stock2_rets = pair_data.iloc[:, 1].pct_change()
+        
+        # Calculate position changes for transaction costs
         pos_changes = signals.diff().fillna(0)
         
-        # 一次性計算所有收益
-        strategy_rets = signals.shift(1) * (stock1_rets - hedge_ratio * stock2_rets) - \
-                       abs(pos_changes) * transaction_cost
+        # Calculate notional exposure for each leg
+        stock1_notional = 1.0
+        stock2_notional = hedge_ratio
+        total_notional = abs(stock1_notional) + abs(stock2_notional)
+        
+        # Normalize position sizes
+        stock1_weight = stock1_notional / total_notional
+        stock2_weight = stock2_notional / total_notional
+        
+        # Calculate strategy returns with proper position sizing
+        strategy_rets = signals.shift(1) * (
+            stock1_weight * stock1_rets - 
+            stock2_weight * stock2_rets
+        )
+        
+        # Apply transaction costs to both legs
+        transaction_costs = abs(pos_changes) * transaction_cost * (
+            abs(stock1_weight) + abs(stock2_weight)
+        )
+        
+        strategy_rets = strategy_rets - transaction_costs
+        
+        # Store additional information
+        strategy_rets.attrs['position_changes'] = pos_changes
+        strategy_rets.attrs['transaction_costs'] = transaction_costs
+        strategy_rets.attrs['weights'] = {'stock1': stock1_weight, 'stock2': stock2_weight}
         
         return strategy_rets
     
+    def calculate_position_exposures(self,
+                                   pair_data: pd.DataFrame,
+                                   signals: pd.Series,
+                                   hedge_ratio: float) -> pd.DataFrame:
+        """Calculate actual position exposures"""
+        stock1_notional = 1.0
+        stock2_notional = hedge_ratio
+        total_notional = abs(stock1_notional) + abs(stock2_notional)
+        
+        stock1_weight = stock1_notional / total_notional
+        stock2_weight = stock2_notional / total_notional
+        
+        stock1_position = signals * stock1_weight
+        stock2_position = -signals * stock2_weight
+        
+        stock1_exposure = stock1_position * pair_data.iloc[:, 0]
+        stock2_exposure = stock2_position * pair_data.iloc[:, 1]
+        
+        return pd.DataFrame({
+            'stock1_position': stock1_position,
+            'stock2_position': stock2_position,
+            'stock1_exposure': stock1_exposure,
+            'stock2_exposure': stock2_exposure,
+            'net_exposure': stock1_exposure + stock2_exposure,
+            'gross_exposure': abs(stock1_exposure) + abs(stock2_exposure)
+        })
+
     def calculate_metrics(self, returns: pd.Series) -> Dict:
-        """優化的績效指標計算"""
+        """Enhanced performance metrics calculation"""
         annual_factor = 252
         
-        # 使用NumPy的向量化操作
+        # Basic return metrics
         total_return = np.expm1(np.sum(np.log1p(returns)))
         annual_return = np.expm1(np.sum(np.log1p(returns)) * annual_factor / len(returns))
         annual_volatility = returns.std() * np.sqrt(annual_factor)
         sharpe_ratio = np.sqrt(annual_factor) * returns.mean() / returns.std() if returns.std() != 0 else 0
         
+        # Win rate metrics
+        winning_trades = (returns > 0).sum()
+        total_trades = (~returns.isna()).sum()
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        
+        # PnL statistics
+        cumulative_returns = (1 + returns).cumprod() - 1
+        drawdowns = cumulative_returns - cumulative_returns.cummax()
+        max_drawdown = drawdowns.min()
+        
+        # Trade metrics
+        avg_win = returns[returns > 0].mean() if len(returns[returns > 0]) > 0 else 0
+        avg_loss = returns[returns < 0].mean() if len(returns[returns < 0]) > 0 else 0
+        profit_factor = abs(returns[returns > 0].sum() / returns[returns < 0].sum()) if len(returns[returns < 0]) > 0 else np.inf
+        
+        daily_pnl = returns.sum()
+        avg_daily_pnl = returns.mean()
+        
+        # Streak analysis
+        streak = (returns > 0).astype(int)
+        streak = streak.map({1: 1, 0: -1})
+        
+        pos_streaks = (streak > 0).astype(int)
+        neg_streaks = (streak < 0).astype(int)
+        
+        pos_streak_groups = (pos_streaks != pos_streaks.shift()).cumsum()
+        neg_streak_groups = (neg_streaks != neg_streaks.shift()).cumsum()
+        
+        longest_win_streak = pos_streaks.groupby(pos_streak_groups).sum().max() if len(pos_streaks) > 0 else 0
+        longest_lose_streak = neg_streaks.groupby(neg_streak_groups).sum().max() if len(neg_streaks) > 0 else 0
+        
         return {
             'total_return': total_return,
             'annual_return': annual_return,
             'annual_volatility': annual_volatility,
-            'sharpe_ratio': sharpe_ratio
+            'sharpe_ratio': sharpe_ratio,
+            'win_rate': win_rate,
+            'total_trades': total_trades,
+            'winning_trades': winning_trades,
+            'losing_trades': total_trades - winning_trades,
+            'total_pnl': daily_pnl,
+            'average_daily_pnl': avg_daily_pnl,
+            'average_win': avg_win,
+            'average_loss': avg_loss,
+            'profit_factor': profit_factor,
+            'max_drawdown': max_drawdown,
+            'longest_win_streak': longest_win_streak,
+            'longest_lose_streak': longest_lose_streak
         }
-
+    
     def check_pair_validity(self, y: pd.Series, x: pd.Series) -> bool:
-        """簡化的配對有效性檢查"""
-        if len(y) < self.min_samples:
+        if len(y) < self.min_samples:  # Minimum number of samples
             return False
             
-        correlation = np.corrcoef(y, x)[0, 1]
+        correlation = np.corrcoef(y, x)[0, 1]  # Check correlation > threshold 
         if abs(correlation) < self.min_correlation:
             return False
             
         try:
-            _, p_value, _ = coint(y, x)
+            _, p_value, _ = coint(y, x)  # Check for cointegration 
             return p_value <= self.coint_pvalue
         except:
             return False
 
     def execute_pair_trade(self, 
-                          stock1_data: pd.Series, 
-                          stock2_data: pd.Series,
-                          pair: Tuple[str, str]) -> Optional[PairTradingResult]:
-        """優化的配對交易執行"""
+                      stock1_data: pd.Series, 
+                      stock2_data: pd.Series,
+                      pair: Tuple[str, str]) -> Optional[PairTradingResult]:
+        """
+        Execute pairs trading strategy for a given pair of stocks
+        
+        Parameters:
+        -----------
+        stock1_data : pd.Series
+            Price series for first stock
+        stock2_data : pd.Series
+            Price series for second stock
+        pair : Tuple[str, str]
+            Stock pair identifiers
+            
+        Returns:
+        --------
+        Optional[PairTradingResult]
+            Trading results if pair is valid, None otherwise
+        """
         try:
-            # 清理並準備數據
+            # Data preparation and validation
             stock1_clean, stock2_clean = self.prepare_pair_data(stock1_data, stock2_data)
             
-            # 快速檢查有效性
-            if not self.check_pair_validity(stock1_clean, stock2_clean):
+            # Basic data quality checks
+            if stock1_clean.empty or stock2_clean.empty:
+                print(f"Empty data for pair {pair}")
                 return None
                 
-            # 計算對沖比率和價差
+            if len(stock1_clean) != len(stock2_clean):
+                print(f"Mismatched data lengths for pair {pair}")
+                return None
+            
+            # Check pair validity (cointegration, correlation, etc.)
+            if not self.check_pair_validity(stock1_clean, stock2_clean):
+                return None
+            
+            # Calculate hedge ratio and spread
             hedge_ratio = self.calculate_hedge_ratio(stock1_clean, stock2_clean)
             spread = stock1_clean - hedge_ratio * stock2_clean
             
-            # 生成信號和計算收益
+            # Calculate z-scores and generate trading signals
             zscore = self.calculate_zscore(spread)
             signals = self.generate_signals(zscore)
-            pair_data = pd.concat([stock1_clean, stock2_clean], axis=1)
-            returns = self.calculate_returns(pair_data, signals, hedge_ratio)
             
-            # 計算績效指標
+            # Prepare pair data for returns calculation
+            pair_data = pd.concat([stock1_clean, stock2_clean], axis=1)
+            pair_data.columns = [f"{pair[0]}_price", f"{pair[1]}_price"]
+            
+            # Calculate returns and exposures
+            returns = self.calculate_returns(pair_data, signals, hedge_ratio)
+            exposures = self.calculate_position_exposures(pair_data, signals, hedge_ratio)
+            
+            # Calculate trade statistics
+            trade_changes = signals.diff().fillna(0)
+            trade_entries = trade_changes != 0
+            trade_count = trade_entries.sum()
+            
+            if trade_count == 0:
+                print(f"No trades generated for pair {pair}")
+                return None
+            
+            # Calculate metrics
             metrics = self.calculate_metrics(returns.dropna())
             
-            return PairTradingResult(
+            # Add trade statistics to metrics
+            metrics.update({
+                'number_of_trades': trade_count,
+                'avg_trade_duration': len(signals) / trade_count if trade_count > 0 else 0,
+                'hedge_ratio': hedge_ratio,
+                'spread_stdev': spread.std(),
+                'correlation': np.corrcoef(stock1_clean, stock2_clean)[0, 1]
+            })
+            
+            # Create enhanced positions DataFrame
+            positions = pd.DataFrame({
+                'signals': signals,
+                'zscore': zscore,
+                'spread': spread,
+                'stock1_price': pair_data.iloc[:, 0],
+                'stock2_price': pair_data.iloc[:, 1],
+                'stock1_position': exposures['stock1_position'],
+                'stock2_position': exposures['stock2_position'],
+                'net_exposure': exposures['net_exposure']
+            })
+            
+            # Add trade markers
+            positions['trade_entry'] = trade_entries
+            positions['trade_exit'] = trade_changes != 0
+            
+            # Calculate drawdown series
+            cumulative_returns = (1 + returns).cumprod()
+            drawdown_series = cumulative_returns / cumulative_returns.cummax() - 1
+            positions['drawdown'] = drawdown_series
+            
+            # Create result object with enhanced information
+            result = PairTradingResult(
                 pair=pair,
                 start_date=stock1_clean.index[0].strftime('%Y-%m-%d'),
                 end_date=stock1_clean.index[-1].strftime('%Y-%m-%d'),
-                positions=pd.DataFrame({'signals': signals, 'zscore': zscore}),
+                positions=positions,
                 returns=returns,
-                metrics=metrics
+                metrics=metrics,
+                exposures=exposures
             )
+            
+            # Add additional attributes for analysis
+            result.hedge_ratio = hedge_ratio
+            result.spread_mean = spread.mean()
+            result.spread_std = spread.std()
+            result.zscore_mean = zscore.mean()
+            result.zscore_std = zscore.std()
+            result.trade_count = trade_count
+            result.drawdown_series = drawdown_series
+            
+            # Log successful execution
+            print(f"Successfully processed pair {pair} with {trade_count} trades")
+            print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}, "
+                f"Total Return: {metrics['total_return']:.2%}, "
+                f"Win Rate: {metrics['win_rate']:.2%}")
+            
+            return result
             
         except Exception as e:
             print(f"Error processing pair {pair}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return None
-
-def main():
-    # 配置
-    DATA_FOLDER = Path('/Users/mouyasushi/k_data/永豐')
-    OUTPUT_FOLDER = Path('/Users/mouyasushi/Desktop/pair_trading/output')
-    START_DATE = '2022-10-14'
-    END_DATE = '2024-10-14'
-    
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-    
-    # 初始化處理器和策略
-    processor = PairsDataProcessor(DATA_FOLDER)
-    strategy = PairsTradingStrategy()
-    
-    try:
-        # 載入和處理數據
-        print("Loading and processing data...")
-        all_stocks_daily = processor.combine_stock_data(START_DATE, END_DATE)
-        
-        # 執行策略
-        print("Executing pairs trading strategy...")
-        results = []
-        stock_codes = all_stocks_daily.columns
-        total_pairs = len(stock_codes) * (len(stock_codes) - 1) // 2
-        processed_pairs = 0
-        
-        # 批次處理配對
-        batch_size = 100  # 每批處理的配對數量
-        pairs = []
-        
-        # 生成所有配對組合
-        for i, stock1 in enumerate(stock_codes):
-            for stock2 in stock_codes[i+1:]:
-                pairs.append((stock1, stock2))
-        
-        # 按批次處理
-        for i in range(0, len(pairs), batch_size):
-            batch_pairs = pairs[i:i + batch_size]
             
-            # 使用較少的worker數量
-            with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-                future_to_pair = {
-                    executor.submit(
-                        strategy.execute_pair_trade,
-                        all_stocks_daily[pair[0]],
-                        all_stocks_daily[pair[1]],
-                        pair
-                    ): pair for pair in batch_pairs
-                }
-                
-                for future in concurrent.futures.as_completed(future_to_pair):
-                    pair = future_to_pair[future]
-                    processed_pairs += 1
-                    
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            results.append(result)
-                            
-                        # 顯示進度
-                        if processed_pairs % 10 == 0:
-                            progress = (processed_pairs / total_pairs) * 100
-                            print(f"Progress: {progress:.1f}% ({processed_pairs}/{total_pairs} pairs)")
-                            
-                    except Exception as e:
-                        print(f"Error with pair {pair}: {str(e)}")
         
-        print(f"\nProcessing complete. Found {len(results)} valid pairs out of {total_pairs} total pairs.")
         
-        if not results:
-            print("No valid pairs found.")
-            return
-        
-        # 儲存結果
-        results_df = pd.DataFrame([{
-            'pair': f"{r.pair[0]}-{r.pair[1]}",
-            'start_date': r.start_date,
-            'end_date': r.end_date,
-            **r.metrics
-        } for r in results])
-        
-        # 儲存中間結果
-        results_df.to_csv(OUTPUT_FOLDER / 'pairs_trading_results.csv', index=False)
-        
-        # 顯示最佳配對
-        best_pairs = results_df.nlargest(5, 'sharpe_ratio')
-        print("\nTop 5 Pairs by Sharpe Ratio:")
-        print(best_pairs)
-
-    except Exception as e:
-        print(f"Error in main execution: {str(e)}")
-        raise
-
-if __name__ == "__main__":
-    main()
