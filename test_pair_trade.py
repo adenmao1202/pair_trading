@@ -1,133 +1,93 @@
 # test_pairs_trading.py
 import pandas as pd
-import numpy as np
 from pathlib import Path
 from basic_coint import PairsDataProcessor, PairsTradingStrategy
-from statsmodels.tsa.stattools import coint
 import concurrent.futures
-import matplotlib.pyplot as plt
-import seaborn as sns
+from datetime import datetime
+from tqdm import tqdm
 
 def test_with_sample_data():
     """
-    Further optimized test suite for pairs trading strategy
+    Test the pairs trading strategy with a small sample of real data
     """
     # Configuration
     DATA_FOLDER = Path('/Users/mouyasushi/k_data/永豐')
     OUTPUT_FOLDER = Path('./test_output')
-    START_DATE = '2023-01-01'
-    END_DATE = '2024-01-14'
+    START_DATE = '2023-01-14'  
+    END_DATE = '2024-10-01'
+    
+    # Create test output directory
+    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
     
     try:
-        # 初始化處理器
+        # 1. Test Data Loading
+        print("1. Testing Data Loading...")
         processor = PairsDataProcessor(DATA_FOLDER)
+        
+        # Load first 5 CSV files only for testing
+        csv_files = list(DATA_FOLDER.glob('*.csv'))[:5]   
+        print(f"Testing with {len(csv_files)} stock files")
+        
+        # Test individual file loading
+        print("\nTesting individual file loading:")
+        for csv_file in csv_files[:2]:  
+            stock_df = processor.load_stock_data(csv_file.stem, csv_file)
+            print(f"Loaded {csv_file.stem}: Shape {stock_df.shape if stock_df is not None else 'None'}")
+        
+        # 2. Test Data Combining
+        print("\n2. Testing Data Combining...")
         all_stocks_daily = processor.combine_stock_data(START_DATE, END_DATE)
+        print(f"Combined data shape: {all_stocks_daily.shape}")
+        print("Sample of combined data:")
+        print(all_stocks_daily.head())
         
-        # 增強版股票篩選
-        def enhanced_filter_stocks(data):
-            # 計算各種指標
-            returns = data.pct_change()
-            volatility = returns.std()
-            avg_price = data.mean()
-            daily_changes = abs(returns).mean()
-            
-            # 過濾條件
-            valid_stocks = []
-            for col in data.columns:
-                price_series = data[col].dropna()
-                if len(price_series) < len(data) * 0.9:  # 至少90%的數據完整性
-                    continue
-                    
-                if (10 <= avg_price[col] <= 1000 and  # 合理價格區間
-                    0.005 <= daily_changes[col] <= 0.03 and  # 適當的日均波動
-                    volatility[col] <= 0.03):  # 控制總體波動率
-                    valid_stocks.append(col)
-            
-            return valid_stocks
-        
-        # 優化配對選擇策略
-        def enhanced_pair_selection(data, valid_stocks, max_pairs=20):
-            pairs = []
-            returns = data[valid_stocks].pct_change()
-            
-            # 計算相關性和波動率
-            correlations = returns.corr()
-            volatilities = returns.std()
-            
-            for i, stock1 in enumerate(valid_stocks):
-                for stock2 in valid_stocks[i+1:]:
-                    corr = correlations.loc[stock1, stock2]
-                    if corr > 0.8:  # 高相關性要求
-                        try:
-                            # 計算價格比率的穩定性
-                            price_ratio = data[stock1] / data[stock2]
-                            ratio_std = price_ratio.std() / price_ratio.mean()
-                            
-                            # 協整合測試
-                            _, p_value, _ = coint(data[stock1], data[stock2])
-                            
-                            if p_value < 0.05 and ratio_std < 0.1:  # 添加價格比率穩定性條件
-                                # 計算配對分數
-                                vol_diff = abs(volatilities[stock1] - volatilities[stock2])
-                                pair_score = corr * (1 - vol_diff) * (1 - ratio_std)
-                                pairs.append((stock1, stock2, corr, p_value, pair_score))
-                                
-                        except:
-                            continue
-            
-            # 按綜合分數排序
-            pairs.sort(key=lambda x: x[4], reverse=True)
-            return pairs[:max_pairs]
-        
-        # 優化策略參數
+        # 3. Test Strategy Initialization
+        print("\n3. Testing Strategy Setup...")
         strategy = PairsTradingStrategy(
-            lookback_period=40,  # 增加回顧期
-            enter_long_zscore_threshold=1.5,  # 調整入場門檻
-            enter_short_zscore_threshold=1.5,
-            exit_zscore_threshold=0.5,
-            min_samples=60,
-            coint_pvalue=0.05,
-            min_correlation=0.8
+            lookback_period=20,
+            enter_long_zscore_threshold=1.0,
+            enter_short_zscore_threshold=1.0,
+            exit_zscore_threshold=0.0
         )
         
-        # 執行優化後的策略
-        print("Applying enhanced stock filtering...")
-        valid_stocks = enhanced_filter_stocks(all_stocks_daily)
-        print(f"Found {len(valid_stocks)} valid stocks after filtering")
-        
-        print("\nSelecting optimal pairs...")
-        best_pairs = enhanced_pair_selection(all_stocks_daily, valid_stocks)
-        print(f"Found {len(best_pairs)} potential pairs")
-        
-        # 執行回測
+        # 4. Test Pair Trading Execution
+        print("\n4. Testing Pair Trading Execution...")
+        stock_codes = all_stocks_daily.columns[:]  
         results = []
-        for pair_info in best_pairs:
-            stock1, stock2, corr, p_value, score = pair_info
-            print(f"\nTesting pair {stock1}-{stock2}:")
-            print(f"Correlation: {corr:.3f}")
-            print(f"Cointegration p-value: {p_value:.3f}")
-            print(f"Pair score: {score:.3f}")
-            
+        
+        # Generate test pairs
+        test_pairs = []
+        for i, stock1 in enumerate(stock_codes):
+            for stock2 in stock_codes[i+1:]:
+                test_pairs.append((stock1, stock2))
+        
+        print(f"Testing with {len(test_pairs)} pairs")
+        
+        # Execute strategy for each pair
+        for pair in tqdm(test_pairs, desc="Processing pairs"):
             try:
                 result = strategy.execute_pair_trade(
-                    all_stocks_daily[stock1],
-                    all_stocks_daily[stock2],
-                    (stock1, stock2)
+                    all_stocks_daily[pair[0]],
+                    all_stocks_daily[pair[1]],
+                    pair
                 )
-                
-                if result is not None and result.metrics['win_rate'] > 0.4:  # 提高勝率要求
+                if result is not None:
                     results.append(result)
-                    print("Trading metrics:")
-                    print(f"Sharpe Ratio: {result.metrics['sharpe_ratio']:.2f}")
-                    print(f"Total Return: {result.metrics['total_return']:.2%}")
+                    print(f"\nProcessed pair {pair}:")
+                    print(f"Max Drawdown: {result.metrics['max_drawdown']:.2%}")
+                    print(f"Winning Trades: {result.metrics['winning_trades']}")
+                    print(f"Losing Trades: {result.metrics['losing_trades']}")
+                    print(f"Average Win: {result.metrics['average_win']:.2%}")
+                    print(f"Average Loss: {result.metrics['average_loss']:.2%}")
                     print(f"Win Rate: {result.metrics['win_rate']:.2%}")
-                    
+                    print(f"Annual Return: {result.metrics['annual_return']:.2%}")
             except Exception as e:
-                print(f"Error processing pair: {str(e)}")
-                continue
+                print(f"Error processing pair {pair}: {str(e)}")
         
-        # 結果分析
+        # 5. Test Results Processing
+        print("\n5. Testing Results Processing...")
         if results:
+            # Create results DataFrame
             results_df = pd.DataFrame([{
                 'pair': f"{r.pair[0]}-{r.pair[1]}",
                 'start_date': r.start_date,
@@ -135,23 +95,117 @@ def test_with_sample_data():
                 **r.metrics
             } for r in results])
             
-            # 篩選表現好的配對
-            results_df = results_df[
-                (results_df['sharpe_ratio'] > 0.5) &  # 提高夏普比率要求
-                (results_df['win_rate'] > 0.4) &      # 提高勝率要求
-                (results_df['total_return'] > 0)       # 要求正收益
+            # Save test results with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            results_df.to_csv(OUTPUT_FOLDER / f'test_results_{timestamp}.csv', index=False)
+            
+            # Calculate Calmar Ratio with safety checks
+            def safe_calmar_ratio(row):
+                try:
+                    if row['max_drawdown'] == 0:
+                        return float('inf')
+                    return abs(row['annual_return']) / abs(row['max_drawdown'])
+                except:
+                    return float('nan')
+
+            results_df['calmar_ratio'] = results_df.apply(safe_calmar_ratio, axis=1)
+            
+            # Sort by Calmar Ratio and get top 10
+            top_10_pairs = results_df.nlargest(10, 'calmar_ratio')
+            
+            # Print summary statistics
+            print(f"\nTotal pairs tested: {len(test_pairs)}")
+            print(f"Valid pairs found: {len(results_df)}")
+            print(f"Success rate: {len(results_df)/len(test_pairs):.2%}")
+            
+            # Print formatted summary of top 10 pairs
+            print("\nTop 10 Pairs by Calmar Ratio:")
+            print("=" * 120)
+            formatted_df = top_10_pairs[[
+                'pair',
+                'calmar_ratio',
+                'annual_return',
+                'max_drawdown',
+                'winning_trades',
+                'losing_trades',
+                'average_win',
+                'average_loss',
+                'win_rate'
+            ]].copy()
+            
+            formatted_df.columns = [
+                'Pair',
+                'Calmar Ratio',
+                'Annual Return',
+                'Max Drawdown',
+                'Winning Trades',
+                'Losing Trades',
+                'Avg Win',
+                'Avg Loss',
+                'Win Rate'
             ]
             
-            if not results_df.empty:
-                print("\nFiltered Results Summary:")
-                print("\nTop pairs by performance:")
-                print(results_df[['pair', 'sharpe_ratio', 'total_return', 'win_rate']])
-            else:
-                print("\nNo pairs met the enhanced performance criteria")
-                
+            # Format the output with alignment
+            pd.set_option('display.float_format', lambda x: '{:.2f}'.format(x) if abs(x) >= 1 else '{:.4f}'.format(x))
+            print(formatted_df.to_string(
+                formatters={
+                    'Calmar Ratio': '{:>8.2f}'.format,
+                    'Annual Return': '{:>8.2%}'.format,
+                    'Max Drawdown': '{:>8.2%}'.format,
+                    'Avg Win': '{:>8.2%}'.format,
+                    'Avg Loss': '{:>8.2%}'.format,
+                    'Win Rate': '{:>8.2%}'.format
+                }
+            ))
+            print("=" * 120)
+            
+            # Save detailed results for top pairs
+            top_pairs_folder = OUTPUT_FOLDER / 'top_pairs'
+            top_pairs_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Save top 10 results to a separate CSV with timestamp
+            top_10_pairs.to_csv(top_pairs_folder / f'top_10_pairs_{timestamp}.csv', index=False)
+            
+            # Print detailed statistics for the best pair
+            best_pair = top_10_pairs.iloc[0]
+            print("\nBest Pair Details:")
+            print("=" * 50)
+            print(f"Pair: {best_pair['pair']}")
+            print(f"Trading Period: {best_pair['start_date']} to {best_pair['end_date']}")
+            print(f"\nPerformance Metrics:")
+            print(f"  - Calmar Ratio: {best_pair['calmar_ratio']:.2f}")
+            print(f"  - Annual Return: {best_pair['annual_return']:.2%}")
+            print(f"  - Max Drawdown: {best_pair['max_drawdown']:.2%}")
+            print(f"\nTrading Statistics:")
+            print(f"  - Win Rate: {best_pair['win_rate']:.2%}")
+            print(f"  - Total Trades: {best_pair['winning_trades'] + best_pair['losing_trades']}")
+            print(f"  - Winning Trades: {best_pair['winning_trades']}")
+            print(f"  - Losing Trades: {best_pair['losing_trades']}")
+            print(f"\nAverage Returns:")
+            print(f"  - Average Win: {best_pair['average_win']:.2%}")
+            print(f"  - Average Loss: {best_pair['average_loss']:.2%}")
+            print("=" * 50)
+            
+            # Save detailed results for the best pair
+            best_pair_folder = top_pairs_folder / f"{best_pair['pair']}_{timestamp}"
+            best_pair_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Find and save the detailed results for the best pair
+            for result in results:
+                if f"{result.pair[0]}-{result.pair[1]}" == best_pair['pair']:
+                    result.positions.to_csv(best_pair_folder / 'positions.csv')
+                    pd.Series(result.returns).to_csv(best_pair_folder / 'returns.csv')
+                    result.exposures.to_csv(best_pair_folder / 'exposures.csv')
+                    break
+                    
+        else:
+            print("No valid pairs found in test data")
+        
     except Exception as e:
         print(f"Error in test execution: {str(e)}")
         raise
+    
+    print("\nTest execution completed!")
 
 if __name__ == "__main__":
     test_with_sample_data()

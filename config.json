@@ -1,0 +1,11 @@
+{
+    "lookback_period": 60,
+    "enter_long_zscore_threshold": 1.5,
+    "enter_short_zscore_threshold": 1.5,
+    "exit_long_zscore_threshold": 0.5,
+    "exit_short_zscore_threshold": 0.5,
+    "min_samples": 252,
+    "coint_pvalue": 0.08,
+    "min_correlation": 0.7,
+    "transaction_cost": 0.001
+}

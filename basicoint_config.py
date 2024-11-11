@@ -8,7 +8,15 @@ from statsmodels.tsa.stattools import coint
 from sklearn.linear_model import LinearRegression
 import concurrent.futures
 from dataclasses import dataclass
+import json
+import logging
 
+# Set up logging
+logging.basicConfig(
+    filename='pairs_trading.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 @dataclass
 class PairTradingResult:
@@ -18,11 +26,18 @@ class PairTradingResult:
     positions: pd.DataFrame
     returns: pd.Series
     metrics: Dict
-    exposures: pd.DataFrame  # Added to track position exposures
+    exposures: pd.DataFrame
 
+class ConfigLoader:
+    @staticmethod
+    def load_config(file_path: str) -> dict:
+        with open(file_path, 'r') as file:
+            config = json.load(file)
+        return config
 
 #################################################################################################
-class PairsDataProcessor:  # checked  
+
+class PairsDataProcessor:
     def __init__(self, data_folder: Path):
         self.data_folder = data_folder
         
@@ -42,7 +57,7 @@ class PairsDataProcessor:  # checked
             return stock_df
             
         except Exception as e:
-            print(f"Error loading {stock_code}: {str(e)}")
+            logging.error(f"Error loading {stock_code}: {str(e)}")
             return None
     
     def resample_to_daily(self, 
@@ -56,7 +71,8 @@ class PairsDataProcessor:  # checked
             daily_df = daily_df.reindex(trading_days)
             return daily_df
             
-        except Exception:
+        except Exception as e:
+            logging.error(f"Error resampling data to daily: {str(e)}")
             return None
     
     def combine_stock_data(self, start_date: str, end_date: str) -> pd.DataFrame:
@@ -69,7 +85,7 @@ class PairsDataProcessor:  # checked
         
         csv_files = list(self.data_folder.glob('*.csv'))
         total_files = len(csv_files)
-        print(f"Found {total_files} CSV files")
+        logging.info(f"Found {total_files} CSV files")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             future_to_stock = {
@@ -89,13 +105,13 @@ class PairsDataProcessor:  # checked
                         
                     if completed % 10 == 0:
                         progress = (completed / total_files) * 100
-                        print(f"Loading progress: {progress:.1f}% ({completed}/{total_files} files)")
+                        logging.info(f"Loading progress: {progress:.1f}% ({completed}/{total_files} files)")
                         
                 except Exception as e:
-                    print(f"Error processing {stock_code}: {str(e)}")
+                    logging.error(f"Error processing {stock_code}: {str(e)}")
                     continue
         
-        print(f"\nSuccessfully loaded {len(all_stocks_daily)} stocks")
+        logging.info(f"Successfully loaded {len(all_stocks_daily)} stocks")
         
         df = pd.DataFrame(all_stocks_daily)
         threshold = len(df.columns) * 0.5
@@ -115,131 +131,88 @@ class PairsDataProcessor:  # checked
             
         return daily_df['Close']
 
-
-
 #########################################################################
 
 class PairsTradingStrategy:
-    def __init__(self, 
-                 lookback_period: int = 60,   # 三個月的計算週期 for spread zscore : 這邊需要改進嗎？
-                 enter_long_zscore_threshold: float = 1.5,
-                 enter_short_zscore_threshold: float = 1.5,
-                 exit_long_zscore_threshold: float = 0.5, 
-                 exit_short_zscore_threshold: float = 0.5, 
-                 min_samples: int = 252,  # 確保有一年資料 
-                 coint_pvalue: float = 0.08,   
-                 min_correlation: float = 0.7):   # checked 
-        self.lookback_period = lookback_period
-        self.enter_long_zscore_threshold = enter_long_zscore_threshold
-        self.enter_short_zscore_threshold = enter_short_zscore_threshold
-        self.exit_long_zscore_threshold = exit_long_zscore_threshold
-        self.exit_short_zscore_threshold = exit_short_zscore_threshold
-        self.min_samples = min_samples
-        self.coint_pvalue = coint_pvalue
-        self.min_correlation = min_correlation
+    def __init__(self, config_path: str):
+        config = ConfigLoader.load_config(config_path)
+        self.lookback_period = config['lookback_period']
+        self.enter_long_zscore_threshold = config['enter_long_zscore_threshold']
+        self.enter_short_zscore_threshold = config['enter_short_zscore_threshold']
+        self.exit_long_zscore_threshold = config['exit_long_zscore_threshold']
+        self.exit_short_zscore_threshold = config['exit_short_zscore_threshold']
+        self.min_samples = config['min_samples']
+        self.coint_pvalue = config['coint_pvalue']
+        self.min_correlation = config['min_correlation']
+        self.transaction_cost = config['transaction_cost']
     
-    def prepare_pair_data(self, y: pd.Series, x: pd.Series) -> Tuple[pd.Series, pd.Series]:    # checked
-        # ~ negates functions after,  making it True where values are " not NaN. "
+    def prepare_pair_data(self, y: pd.Series, x: pd.Series) -> Tuple[pd.Series, pd.Series]:
         mask = ~np.isnan(y) & ~np.isnan(x)
         return y[mask], x[mask]
     
-    def calculate_hedge_ratio(self, y: pd.Series, x: pd.Series) -> float:  # Beta in coint pairs  # checked 
-        """ we might change the hedge ratio ( beta) cal method in future """
+    def calculate_hedge_ratio(self, y: pd.Series, x: pd.Series) -> float:
         return np.cov(y, x)[0, 1] / np.var(x)
     
-    def calculate_zscore(self, spread: pd.Series) -> pd.Series:   # checked --> 這邊再確認一下為什麼要這樣計算 
-        mean = pd.Series(index=spread.index, dtype='float32')
-        std = pd.Series(index=spread.index, dtype='float32')
-        
-        for i in range(self.lookback_period, len(spread)):  
-            window = spread.iloc[i-self.lookback_period:i]
-            mean.iloc[i] = window.mean()
-            std.iloc[i] = window.std()
-            
+    def calculate_zscore(self, spread: pd.Series) -> pd.Series:
+        mean = spread.rolling(window=self.lookback_period).mean()
+        std = spread.rolling(window=self.lookback_period).std()
         return (spread - mean) / std
     
-    def generate_signals(self, zscore: pd.Series) -> pd.Series:  # checked
-        """Enhanced signal generation with position tracking"""
+    def generate_signals(self, zscore: pd.Series) -> pd.Series:
         signals = pd.Series(0, index=zscore.index)
         position = 0
         
         for i in range(len(zscore)):
-            if position == 0:  # No position
+            if position == 0:
                 if zscore.iloc[i] < -self.enter_long_zscore_threshold:
                     position = 1
                     signals.iloc[i] = 1
                 elif zscore.iloc[i] > self.enter_short_zscore_threshold:
                     position = -1
                     signals.iloc[i] = -1
-            elif position == 1:  # Long position
+            elif position == 1:
                 if zscore.iloc[i] >= self.exit_long_zscore_threshold:
                     position = 0
                     signals.iloc[i] = 0
-            elif position == -1:  # Short position
+            elif position == -1:
                 if zscore.iloc[i] <= -self.exit_short_zscore_threshold:
                     position = 0
                     signals.iloc[i] = 0
                     
         return signals
     
-    
-    # 這邊更改手續費 
     def calculate_returns(self, 
                          pair_data: pd.DataFrame, 
                          signals: pd.Series, 
-                         hedge_ratio: float,
-                         transaction_cost: float = 0.001) -> pd.Series:   #  checked 
-
-        # Calculate returns for both stocks
+                         hedge_ratio: float) -> pd.Series:
         stock1_rets = pair_data.iloc[:, 0].pct_change()
         stock2_rets = pair_data.iloc[:, 1].pct_change()
-        
-        # Calculate position changes for later use of transaction costs
         pos_changes = signals.diff().fillna(0)
         
-        # Calculate notional exposure for each leg
         stock1_notional = 1.0
         stock2_notional = hedge_ratio
         total_notional = abs(stock1_notional) + abs(stock2_notional)
         
-        # weight for two stocks: actual position 
-        # for multi pairs in future, change here 
         stock1_weight = stock1_notional / total_notional
         stock2_weight = stock2_notional / total_notional
         
-        # Calculate strategy returns: 
-        """ 每一次交易，為了對沖風險，一定是多空一組一起做 """
         strategy_rets = signals.shift(1) * (
             stock1_weight * stock1_rets - 
             stock2_weight * stock2_rets
         )
         
-        # Apply transaction costs to both legs
-        transaction_costs = abs(pos_changes) * transaction_cost * (
+        transaction_costs = abs(pos_changes) * self.transaction_cost * (
             abs(stock1_weight) + abs(stock2_weight)
         )
         
         strategy_rets = strategy_rets - transaction_costs
         
-        # Store additional information
-        strategy_rets.attrs['position_changes'] = pos_changes
-        strategy_rets.attrs['transaction_costs'] = transaction_costs
-        strategy_rets.attrs['weights'] = {'stock1': stock1_weight, 'stock2': stock2_weight}
-        
         return strategy_rets
-    
     
     def calculate_position_exposures(self,
                                    pair_data: pd.DataFrame,
                                    signals: pd.Series,
-                                   hedge_ratio: float) -> pd.DataFrame:   # cheked 
-        """
-        1. Gross_exposure : Larger gross exposure means more liquidity is needed to open and close the position, 
-        increasing the risk of slippage (adverse price movements during trade execution).
-        
-        2. Net_exposure :  This value shows the overall directional bias of the position, 
-        indicating whether the pair trade is net long or net short in dollar terms.
-        """
+                                   hedge_ratio: float) -> pd.DataFrame:
         stock1_notional = 1.0
         stock2_notional = hedge_ratio
         total_notional = abs(stock1_notional) + abs(stock2_notional)
@@ -247,8 +220,8 @@ class PairsTradingStrategy:
         stock1_weight = stock1_notional / total_notional
         stock2_weight = stock2_notional / total_notional
         
-        stock1_position = signals * stock1_weight  #  long leg
-        stock2_position = -signals * stock2_weight #  short leg 
+        stock1_position = signals * stock1_weight
+        stock2_position = -signals * stock2_weight
         
         stock1_exposure = stock1_position * pair_data.iloc[:, 0]
         stock2_exposure = stock2_position * pair_data.iloc[:, 1]
@@ -259,52 +232,31 @@ class PairsTradingStrategy:
             'stock1_exposure': stock1_exposure,
             'stock2_exposure': stock2_exposure,
             'net_exposure': stock1_exposure + stock2_exposure,  
-            'gross_exposure': abs(stock1_exposure) + abs(stock2_exposure)  
+            'gross_exposure': abs(stock1_exposure) + abs(stock2_exposure)
         })
 
-    
-    def calculate_metrics(self, returns: pd.Series) -> Dict:  # checked 
-        """returns : daily return in pct form """
+    def calculate_metrics(self, returns: pd.Series) -> Dict:
         annual_factor = 252
         
-        # Basic return metrics
-        total_return = np.expm1(np.sum(np.log1p(returns)))  # use log return 
+        total_return = np.expm1(np.sum(np.log1p(returns)))
         annual_return = np.expm1(np.sum(np.log1p(returns)) * annual_factor / len(returns))
         annual_volatility = returns.std() * np.sqrt(annual_factor)
-        sharpe_ratio = np.sqrt(annual_factor) * returns.mean() / returns.std() if returns.std() != 0 else 0  # annualized mean(ret) / annualized std = 252.root * daily ret / daily std 
+        sharpe_ratio = np.sqrt(annual_factor) * returns.mean() / returns.std() if returns.std() != 0 else 0
         
-        
-        # Win rate metrics
         winning_trades = (returns > 0).sum()
         total_trades = (~returns.isna()).sum()
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
         
-        # PnL statistics
         cumulative_returns = (1 + returns).cumprod() - 1
         drawdowns = cumulative_returns - cumulative_returns.cummax()
         max_drawdown = drawdowns.min()
         
-        # Trade metrics
         avg_win = returns[returns > 0].mean() if len(returns[returns > 0]) > 0 else 0
         avg_loss = returns[returns < 0].mean() if len(returns[returns < 0]) > 0 else 0
         profit_factor = abs(returns[returns > 0].sum() / returns[returns < 0].sum()) if len(returns[returns < 0]) > 0 else np.inf
-        # Ratio of the sum of profits to the sum of losses. It’s a measure of profitability.
-
-        daily_pnl = returns.sum() 
+        
+        daily_pnl = returns.sum()
         avg_daily_pnl = returns.mean()
-        
-        # Streak analysis
-        streak = (returns > 0).astype(int)
-        streak = streak.map({1: 1, 0: -1})
-        
-        pos_streaks = (streak > 0).astype(int)
-        neg_streaks = (streak < 0).astype(int)
-        
-        pos_streak_groups = (pos_streaks != pos_streaks.shift()).cumsum()
-        neg_streak_groups = (neg_streaks != neg_streaks.shift()).cumsum()
-        
-        longest_win_streak = pos_streaks.groupby(pos_streak_groups).sum().max() if len(pos_streaks) > 0 else 0
-        longest_lose_streak = neg_streaks.groupby(neg_streak_groups).sum().max() if len(neg_streaks) > 0 else 0
         
         return {
             'total_return': total_return,
@@ -320,83 +272,64 @@ class PairsTradingStrategy:
             'average_win': avg_win,
             'average_loss': avg_loss,
             'profit_factor': profit_factor,
-            'max_drawdown': max_drawdown,
-            'longest_win_streak': longest_win_streak,
-            'longest_lose_streak': longest_lose_streak
+            'max_drawdown': max_drawdown
         }
     
-    
-    def check_pair_validity(self, y: pd.Series, x: pd.Series) -> bool:   # checked 
-        if len(y) < self.min_samples:  # Minimum number of samples
+    def check_pair_validity(self, y: pd.Series, x: pd.Series) -> bool:
+        if len(y) < self.min_samples:
             return False
             
-        correlation = np.corrcoef(y, x)[0, 1]  # Check correlation > threshold 
+        correlation = np.corrcoef(y, x)[0, 1]
         if abs(correlation) < self.min_correlation:
             return False
             
         try:
-            _, p_value, _ = coint(y, x)  # Check for cointegration 
+            _, p_value, _ = coint(y, x)
             return p_value <= self.coint_pvalue
-        except:
+        except Exception as e:
+            logging.error(f"Error in cointegration test: {str(e)}")
             return False
 
     def execute_pair_trade(self, 
                       stock1_data: pd.Series, 
                       stock2_data: pd.Series,
                       pair: Tuple[str, str]) -> Optional[PairTradingResult]:
-        """
-        Func : Execute pairs trading strategy for a given pair of stocks
-        
-        """
         try:
-            # Use prepare_pair_data to mask out Nan dataset 
-            stock1_clean, stock2_clean = self.prepare_pair_data(stock1_data, stock2_data)   # after masking out Nan, there should be no Nan in data 
+            stock1_clean, stock2_clean = self.prepare_pair_data(stock1_data, stock2_data)
             
-            # check if datas are empty 
-            if stock1_clean.empty or stock2_clean.empty:   
-                print(f"Empty data for pair {pair}")
+            if stock1_clean.empty or stock2_clean.empty:
+                logging.warning(f"Empty data for pair {pair}")
                 return None
             
-            
-            # check if lenght is equal 
-            if len(stock1_clean) != len(stock2_clean):   
-                print(f"Mismatched data lengths for pair {pair}")
+            if len(stock1_clean) != len(stock2_clean):
+                logging.warning(f"Mismatched data lengths for pair {pair}")
                 return None
             
-            # Check pair validity (coint, corr, min sample )
             if not self.check_pair_validity(stock1_clean, stock2_clean):
                 return None
             
-            # Calculate hedge ratio and spread
-            # spread alread includes Beta cal by hedge ratio 
             hedge_ratio = self.calculate_hedge_ratio(stock1_clean, stock2_clean)
             spread = stock1_clean - hedge_ratio * stock2_clean
             
-            # Calculate z-scores and generate trading signals
             zscore = self.calculate_zscore(spread)
             signals = self.generate_signals(zscore)
             
-            # Prepare pair data for returns calculation
             pair_data = pd.concat([stock1_clean, stock2_clean], axis=1)
             pair_data.columns = [f"{pair[0]}_price", f"{pair[1]}_price"]
             
-            # Calculate returns and exposures
             returns = self.calculate_returns(pair_data, signals, hedge_ratio)
             exposures = self.calculate_position_exposures(pair_data, signals, hedge_ratio)
             
-            # Calculate trade statistics
             trade_changes = signals.diff().fillna(0)
             trade_entries = trade_changes != 0
             trade_count = trade_entries.sum()
             
             if trade_count == 0:
-                print(f"No trades generated for pair {pair}")
+                logging.info(f"No trades generated for pair {pair}")
                 return None
             
-            # Calculate metrics
             metrics = self.calculate_metrics(returns.dropna())
             
-            # Add trade statistics to metrics
             metrics.update({
                 'number_of_trades': trade_count,
                 'avg_trade_duration': len(signals) / trade_count if trade_count > 0 else 0,
@@ -405,7 +338,6 @@ class PairsTradingStrategy:
                 'correlation': np.corrcoef(stock1_clean, stock2_clean)[0, 1]
             })
             
-            # Create enhanced positions DataFrame
             positions = pd.DataFrame({
                 'signals': signals,
                 'zscore': zscore,
@@ -417,16 +349,13 @@ class PairsTradingStrategy:
                 'net_exposure': exposures['net_exposure']
             })
             
-            # Add trade markers
             positions['trade_entry'] = trade_entries
             positions['trade_exit'] = trade_changes != 0
             
-            # Calculate drawdown series
             cumulative_returns = (1 + returns).cumprod()
             drawdown_series = cumulative_returns / cumulative_returns.cummax() - 1
             positions['drawdown'] = drawdown_series
             
-            # Create result object with enhanced information
             result = PairTradingResult(
                 pair=pair,
                 start_date=stock1_clean.index[0].strftime('%Y-%m-%d'),
@@ -437,28 +366,15 @@ class PairsTradingStrategy:
                 exposures=exposures
             )
             
-            # Add additional attributes for analysis
             result.hedge_ratio = hedge_ratio
             result.spread_mean = spread.mean()
             result.spread_std = spread.std()
-            result.zscore_mean = zscore.mean()
-            result.zscore_std = zscore.std()
             result.trade_count = trade_count
             result.drawdown_series = drawdown_series
             
-            # Log successful execution
-            print(f"Successfully processed pair {pair} with {trade_count} trades")
-            print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}, "
-                f"Total Return: {metrics['total_return']:.2%}, "
-                f"Win Rate: {metrics['win_rate']:.2%}")
-            
+            logging.info(f"Successfully processed pair {pair} with {trade_count} trades")
             return result
             
         except Exception as e:
-            print(f"Error processing pair {pair}: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            logging.error(f"Error processing pair {pair}: {str(e)}", exc_info=True)
             return None
-            
-        
-        

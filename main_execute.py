@@ -1,5 +1,3 @@
-# main_pairs_trading.py
-
 from pathlib import Path
 import concurrent.futures
 import pandas as pd
